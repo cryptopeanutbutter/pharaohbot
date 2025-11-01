@@ -1,19 +1,14 @@
 import asyncio
 import datetime as dt
 import difflib
-import hashlib
-import hmac
-import json
 import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import aiohttp
 import aiosqlite
 import discord
-from aiohttp import web
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -78,14 +73,6 @@ class BotConfig:
     monitored_vc_id: Optional[int]
     earning_text_channel_ids: List[int]
     database_path: str
-    cryptoapis_key: Optional[str]
-    cryptoapis_wallet_id: Optional[str]
-    cryptoapis_hmac_secret: Optional[str]
-    blockscout_api_url: str
-    confirmations_required: int
-    webhook_port: int
-    hd_mnemonic: Optional[str]
-    hd_derivation_path: str
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -116,14 +103,6 @@ class BotConfig:
             monitored_vc_id=int(os.getenv("MONITORED_VC_ID", "0")) or None,
             earning_text_channel_ids=env_list("EARNING_TEXT_CHANNEL_IDS"),
             database_path=os.getenv("DATABASE_PATH", "./ledger.sqlite3"),
-            cryptoapis_key=os.getenv("CRYPTOAPIS_API_KEY") or None,
-            cryptoapis_wallet_id=os.getenv("CRYPTOAPIS_WALLET_ID") or None,
-            cryptoapis_hmac_secret=os.getenv("CRYPTOAPIS_WEBHOOK_HMAC_SECRET") or None,
-            blockscout_api_url=os.getenv("BLOCKSCOUT_API_URL", "https://api.scan.pulsechain.com/api"),
-            confirmations_required=env_int("CONFIRMATIONS_REQUIRED", 12),
-            webhook_port=env_int("WEBHOOK_PORT", 3001),
-            hd_mnemonic=os.getenv("HD_MNEMONIC") or None,
-            hd_derivation_path=os.getenv("HD_DERIVATION_PATH", "m/44'/60'/0'/0/"),
         )
 # ---------------------------------------------
 # SQLite helpers
@@ -172,15 +151,6 @@ class Database:
                 admin_msg_id TEXT,
                 created_at TEXT,
                 processed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS deposit_addresses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                discord_id TEXT,
-                address TEXT,
-                backend TEXT,
-                status TEXT,
-                created_at TEXT,
-                used_at TEXT
             );
             CREATE TABLE IF NOT EXISTS config(
                 key TEXT PRIMARY KEY,
@@ -258,222 +228,6 @@ class PriceCache:
         except Exception as exc:  # pragma: no cover - logging fallback
             logging.warning("Failed to fetch price: %s", exc)
         return None
-# ---------------------------------------------
-# HD wallet fallback utilities (TEST ONLY)
-# ---------------------------------------------
-
-# secp256k1 parameters
-_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-_A = 0
-_B = 7
-_Gx = 55066263022277343669578718895168534326250603453777594175500187360389116729240
-_Gy = 32670510020758816978083085130507043184471273380659243275938904335757337482424
-_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-
-
-def _modinv(a: int, n: int) -> int:
-    return pow(a, -1, n)
-
-
-def _point_add(p1: Tuple[int, int], p2: Tuple[int, int]) -> Tuple[int, int]:
-    if p1 == (None, None):
-        return p2
-    if p2 == (None, None):
-        return p1
-    x1, y1 = p1
-    x2, y2 = p2
-    if x1 == x2 and (y1 + y2) % _P == 0:
-        return (None, None)
-    if x1 == x2 and y1 == y2:
-        return _point_double(p1)
-    m = ((y2 - y1) * _modinv((x2 - x1) % _P, _P)) % _P
-    x3 = (m * m - x1 - x2) % _P
-    y3 = (m * (x1 - x3) - y1) % _P
-    return x3, y3
-
-
-def _point_double(p: Tuple[int, int]) -> Tuple[int, int]:
-    x, y = p
-    if y == 0:
-        return (None, None)
-    m = ((3 * x * x + _A) * _modinv(2 * y, _P)) % _P
-    x3 = (m * m - 2 * x) % _P
-    y3 = (m * (x - x3) - y) % _P
-    return x3, y3
-
-
-def _scalar_mult(k: int, point: Tuple[int, int]) -> Tuple[int, int]:
-    if k % _N == 0 or point == (None, None):
-        return (None, None)
-    result = (None, None)
-    addend = point
-    while k:
-        if k & 1:
-            result = _point_add(result, addend)
-        addend = _point_double(addend)
-        k >>= 1
-    return result
-
-
-def _pbkdf2_hmac_sha512(password: str, salt: str, iterations: int, dklen: int) -> bytes:
-    return hashlib.pbkdf2_hmac("sha512", password.encode(), salt.encode(), iterations, dklen)
-
-
-def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
-    return _pbkdf2_hmac_sha512(mnemonic, "mnemonic" + passphrase, 2048, 64)
-
-
-def _hmac_sha512(key: bytes, data: bytes) -> bytes:
-    return hmac.new(key, data, hashlib.sha512).digest()
-
-
-def private_to_public(privkey: bytes) -> bytes:
-    pk_int = int.from_bytes(privkey, "big")
-    point = _scalar_mult(pk_int, (_Gx, _Gy))
-    if point == (None, None):
-        raise ValueError("Invalid point")
-    x, y = point
-    return b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
-
-
-def _ckd_priv(parent_key: bytes, parent_chain_code: bytes, index: int) -> Tuple[bytes, bytes]:
-    hardened = index >= 0x80000000
-    if hardened:
-        data = b"\x00" + parent_key + index.to_bytes(4, "big")
-    else:
-        pub = private_to_public(parent_key)
-        data = pub + index.to_bytes(4, "big")
-    i = _hmac_sha512(parent_chain_code, data)
-    il, ir = i[:32], i[32:]
-    ki = (int.from_bytes(il, "big") + int.from_bytes(parent_key, "big")) % _N
-    if ki == 0:
-        raise ValueError("Invalid derived key")
-    return ki.to_bytes(32, "big"), ir
-
-
-def keccak256(data: bytes) -> bytes:
-    # Lightweight pure-Python Keccak-256 implementation (sponge construction)
-    # This implementation is intentionally straightforward and only used for
-    # deriving fallback addresses. Avoid for performance-critical paths.
-    b = 1600 - 512 * 2
-    w = 64
-    l = 6
-    nr = 12 + 2 * l
-
-    def _rot(x, n):
-        return ((x << n) | (x >> (w - n))) & ((1 << w) - 1)
-
-    def _keccak_f(state):
-        RC = [
-            0x0000000000000001,
-            0x0000000000008082,
-            0x800000000000808A,
-            0x8000000080008000,
-            0x000000000000808B,
-            0x0000000080000001,
-            0x8000000080008081,
-            0x8000000000008009,
-            0x000000000000008A,
-            0x0000000000000088,
-            0x0000000080008009,
-            0x000000008000000A,
-            0x000000008000808B,
-            0x800000000000008B,
-            0x8000000000008089,
-            0x8000000000008003,
-            0x8000000000008002,
-            0x8000000000000080,
-            0x000000000000800A,
-            0x800000008000000A,
-            0x8000000080008081,
-            0x8000000000008080,
-            0x0000000080000001,
-            0x8000000080008008,
-        ]
-        r = [
-            [0, 36, 3, 41, 18],
-            [1, 44, 10, 45, 2],
-            [62, 6, 43, 15, 61],
-            [28, 55, 25, 21, 56],
-            [27, 20, 39, 8, 14],
-        ]
-        for ir in range(nr):
-            c = [state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20] for x in range(5)]
-            d = [c[(x - 1) % 5] ^ _rot(c[(x + 1) % 5], 1) for x in range(5)]
-            for x in range(5):
-                for y in range(5):
-                    state[x + 5 * y] ^= d[x]
-            b_tmp = [0] * 25
-            for x in range(5):
-                for y in range(5):
-                    b_tmp[y + 5 * ((2 * x + 3 * y) % 5)] = _rot(state[x + 5 * y], r[x][y])
-            for x in range(5):
-                for y in range(5):
-                    state[x + 5 * y] = b_tmp[x + 5 * y] ^ ((~b_tmp[((x + 1) % 5) + 5 * y]) & b_tmp[((x + 2) % 5) + 5 * y])
-            state[0] ^= RC[ir]
-
-    rate = b
-    block_size = 0
-    state = [0] * 25
-    buf = bytearray()
-
-    for byte in data:
-        buf.append(byte)
-        block_size += 8
-        if block_size == rate:
-            for i in range(rate // 64):
-                state[i] ^= int.from_bytes(buf[i * 8:(i + 1) * 8], "little")
-            _keccak_f(state)
-            buf = bytearray()
-            block_size = 0
-
-    buf.append(0x01)
-    while (len(buf) * 8) % rate != rate - 8:
-        buf.append(0x00)
-    buf.append(0x80)
-    for i in range(rate // 64):
-        chunk = buf[i * 8:(i + 1) * 8]
-        if len(chunk) < 8:
-            chunk = chunk + b"\x00" * (8 - len(chunk))
-        state[i] ^= int.from_bytes(chunk, "little")
-    _keccak_f(state)
-    out = bytearray()
-    while len(out) < 32:
-        for i in range(rate // 64):
-            out.extend(state[i].to_bytes(8, "little"))
-        if len(out) >= 32:
-            break
-        _keccak_f(state)
-    return bytes(out[:32])
-
-
-def eth_checksum_address(address: str) -> str:
-    address = address.lower().replace("0x", "")
-    hash_hex = keccak256(address.encode()).hex()
-    checksum = "0x" + "".join(
-        c.upper() if int(hash_hex[i], 16) >= 8 else c
-        for i, c in enumerate(address)
-    )
-    return checksum
-
-
-def derive_eth_address(mnemonic: str, path: str) -> str:
-    seed = mnemonic_to_seed(mnemonic)
-    key = seed[:32]
-    chain = seed[32:]
-    segments = path.strip().split('/')
-    if segments[0] != 'm':
-        raise ValueError("Invalid path")
-    for seg in segments[1:]:
-        hardened = seg.endswith("'")
-        if hardened:
-            index = int(seg[:-1]) + 0x80000000
-        else:
-            index = int(seg)
-        key, chain = _ckd_priv(key, chain, index)
-    pub = private_to_public(key)
-    addr = keccak256(pub[1:])[12:]
-    return eth_checksum_address("0x" + addr.hex())
 # ---------------------------------------------
 # Economy helpers
 # ---------------------------------------------
@@ -594,50 +348,17 @@ class PharaohBot(commands.Bot):
         self.tree = app_commands.CommandTree(self)
         self.voice_presence: Dict[int, dt.datetime] = {}
         self.chat_cooldowns: Dict[Tuple[int, int], dt.datetime] = {}
-        self.web_app_runner: Optional[web.AppRunner] = None
 
     async def setup_hook(self) -> None:
         await self.db.init()
         await self.sync_config()
         voice_tick_loop.start(self)
-        await self.start_webhook()
         guild = discord.Object(id=self.config.guild_id) if self.config.guild_id else None
         await self.tree.sync(guild=guild)
         logging.info("Slash commands synced")
 
-    async def start_webhook(self) -> None:
-        if not self.config.cryptoapis_key:
-            return
-        app = web.Application()
-
-        async def handle(request: web.Request) -> web.Response:
-            raw_body = await request.read()
-            signature = request.headers.get("X-Hub-Signature")
-            secret = self.config.cryptoapis_hmac_secret or ""
-            if secret:
-                computed = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-                if not signature or not hmac.compare_digest(signature, computed):
-                    logging.warning("Invalid webhook signature")
-                    return web.Response(status=401, text="invalid signature")
-            try:
-                payload = json.loads(raw_body.decode())
-            except json.JSONDecodeError:
-                return web.Response(status=400, text="invalid json")
-            await self.handle_deposit_webhook(payload)
-            return web.Response(text="ok")
-
-        app.router.add_post("/webhook/deposit", handle)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.config.webhook_port)
-        await site.start()
-        self.web_app_runner = runner
-        logging.info("Webhook listening on port %s", self.config.webhook_port)
-
     async def close(self) -> None:
         voice_tick_loop.cancel()
-        if self.web_app_runner:
-            await self.web_app_runner.cleanup()
         await self.db.close()
         await super().close()
 
@@ -654,54 +375,6 @@ class PharaohBot(commands.Bot):
 
     def is_admin(self, user_id: int) -> bool:
         return user_id == self.config.owner_id or user_id in self.config.admin_ids
-
-    async def handle_deposit_webhook(self, payload: dict) -> None:
-        try:
-            address = payload["data"]["item"]["depositAddress"]
-            amount = float(payload["data"]["item"].get("amount", {}).get("amount", "0"))
-            tx_hash = payload["data"]["item"].get("transactionHash")
-            confirmations = int(payload["data"]["item"].get("currentConfirmations", 0))
-        except Exception as exc:
-            logging.error("Malformed webhook payload: %s", exc)
-            return
-        if confirmations < self.config.confirmations_required:
-            logging.info("Webhook for %s pending confirmations", address)
-            return
-        row = await self.db.fetchone(
-            "SELECT discord_id, backend, status FROM deposit_addresses WHERE address = ?",
-            (address,),
-        )
-        if not row:
-            logging.warning("Webhook for unknown address %s", address)
-            return
-        if row["status"] == "USED":
-            logging.info("Address %s already used", address)
-            return
-        discord_id = int(row["discord_id"])
-        await self.db.execute(
-            "UPDATE deposit_addresses SET status='USED', used_at=? WHERE address=?",
-            (utcnow().isoformat(), address),
-        )
-        await self.economy.add_ledger_entry(
-            discord_id,
-            amount,
-            "DEPOSIT",
-            note=f"Deposit via {row['backend']} tx {tx_hash}",
-            ref=tx_hash,
-        )
-        logging.info("Credited %.6f pDAI to %s", amount, discord_id)
-        user = self.get_user(discord_id)
-        if user:
-            try:
-                await user.send(f"Deposit of {amount:.4f} pDAI confirmed (tx: {tx_hash}).")
-            except discord.HTTPException:
-                pass
-
-    async def fetch_blockscout_json(self, params: Dict[str, str]) -> dict:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self.config.blockscout_api_url, params=params, timeout=15) as resp:
-                resp.raise_for_status()
-                return await resp.json()
 # ---------------------------------------------
 # Background voice earning loop
 # ---------------------------------------------
@@ -821,90 +494,6 @@ async def balance_command(interaction: discord.Interaction) -> None:
         )
         embed.add_field(name="Pending withdrawals", value=desc, inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@PharaohBot.tree.command(name="deposit", description="Get your deposit address.")
-async def deposit_command(interaction: discord.Interaction) -> None:
-    bot: PharaohBot = interaction.client  # type: ignore
-    await ensure_interaction_response(interaction)
-    user_id = interaction.user.id
-    await bot.economy.ensure_user(user_id)
-    backend = "custodial" if bot.config.cryptoapis_key else "hd"
-    address = await get_or_create_deposit_address(bot, user_id, backend)
-    if not address:
-        await interaction.followup.send("Failed to create deposit address. Contact an admin.", ephemeral=True)
-        return
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?data={address}&size=200x200"
-    warning = ""
-    if backend == "hd":
-        warning = "\n\n⚠️ TEST ONLY: HD fallback addresses are not safe for real funds."
-    embed = discord.Embed(title="Deposit Address", description=f"`{address}`{warning}")
-    embed.set_image(url=qr_url)
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-async def get_or_create_deposit_address(bot: PharaohBot, user_id: int, backend: str) -> Optional[str]:
-    row = await bot.db.fetchone(
-        "SELECT address FROM deposit_addresses WHERE discord_id = ? AND status = 'ACTIVE'",
-        (str(user_id),),
-    )
-    if row:
-        return row["address"]
-    if backend == "custodial":
-        address = await create_custodial_address(bot, user_id)
-        backend_label = "CRYPTOAPIS"
-    else:
-        address = await derive_hd_address(bot, user_id)
-        backend_label = "HD_TEST"
-    if not address:
-        return None
-    await bot.db.execute(
-        "INSERT INTO deposit_addresses(discord_id, address, backend, status, created_at) VALUES (?, ?, ?, 'ACTIVE', ?)",
-        (str(user_id), address, backend_label, utcnow().isoformat()),
-    )
-    return address
-
-
-async def create_custodial_address(bot: PharaohBot, user_id: int) -> Optional[str]:
-    if not bot.config.cryptoapis_key or not bot.config.cryptoapis_wallet_id:
-        return None
-    payload = {
-        "context": "discord-pharaoh",
-        "data": {"item": {"label": f"discord-{user_id}"}},
-    }
-    url = f"https://rest.cryptoapis.io/v2/wallet-as-a-service/wallets/{bot.config.cryptoapis_wallet_id}/addresses"
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-Key": bot.config.cryptoapis_key,
-    }
-    try:
-        response = await asyncio.to_thread(
-            requests.post,
-            url,
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=20,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("data", {}).get("item", {}).get("address")
-    except Exception as exc:
-        logging.error("Failed to create custodial address: %s", exc)
-        return None
-
-
-async def derive_hd_address(bot: PharaohBot, user_id: int) -> Optional[str]:
-    mnemonic = bot.config.hd_mnemonic
-    if not mnemonic:
-        return None
-    base_path = bot.config.hd_derivation_path.rstrip('/')
-    index = user_id & 0x7FFFFFFF
-    path = f"{base_path}/{index}"
-    try:
-        return derive_eth_address(mnemonic, path)
-    except Exception as exc:
-        logging.error("Failed to derive HD address: %s", exc)
-        return None
 
 
 @PharaohBot.tree.command(name="withdraw", description="Request a withdrawal.")
@@ -1175,83 +764,6 @@ async def revoke_command(interaction: discord.Interaction, user: discord.User, a
     bot: PharaohBot = interaction.client  # type: ignore
     await bot.economy.add_ledger_entry(user.id, -amount, "REVOKE", note=f"Manual revoke by {interaction.user}")
     await interaction.response.send_message(f"Revoked {amount} pDAI from {user.display_name}.", ephemeral=True)
-
-
-@PharaohBot.tree.command(name="proof", description="Submit proof of a deposit transaction (HD fallback only).")
-@app_commands.describe(txhash="Transaction hash")
-async def proof_command(interaction: discord.Interaction, txhash: str) -> None:
-    bot: PharaohBot = interaction.client  # type: ignore
-    if bot.config.cryptoapis_key:
-        await interaction.response.send_message("Proof command is only available for HD fallback.", ephemeral=True)
-        return
-    await ensure_interaction_response(interaction)
-    txhash = txhash.strip()
-    row = await bot.db.fetchone(
-        "SELECT address FROM deposit_addresses WHERE discord_id = ? AND status='ACTIVE'",
-        (str(interaction.user.id),),
-    )
-    if not row:
-        await interaction.followup.send("No active deposit address found.", ephemeral=True)
-        return
-    address = row["address"].lower()
-    try:
-        tx_data = await bot.fetch_blockscout_json({"module": "proxy", "action": "eth_getTransactionByHash", "txhash": txhash})
-        if "result" not in tx_data or tx_data["result"] is None:
-            await interaction.followup.send("Transaction not found.", ephemeral=True)
-            return
-        tx = tx_data["result"]
-        if tx.get("to", "").lower() != address:
-            await interaction.followup.send("Transaction was not sent to your deposit address.", ephemeral=True)
-            return
-        receipt = await bot.fetch_blockscout_json({"module": "proxy", "action": "eth_getTransactionReceipt", "txhash": txhash})
-        result_receipt = receipt.get("result")
-        if not result_receipt or result_receipt.get("blockNumber") is None:
-            await interaction.followup.send("Transaction pending. Try again later.", ephemeral=True)
-            return
-        block_number = int(result_receipt["blockNumber"], 16)
-        latest_block = await bot.fetch_blockscout_json({"module": "proxy", "action": "eth_blockNumber"})
-        latest_number = int(latest_block.get("result", "0x0"), 16)
-        confirmations = latest_number - block_number
-        if confirmations < bot.config.confirmations_required:
-            await interaction.followup.send(
-                f"Needs {bot.config.confirmations_required} confirmations (currently {confirmations}).",
-                ephemeral=True,
-            )
-            return
-        transfer_sig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-        dest_topic = "0x" + address.replace("0x", "").rjust(64, "0")
-        credited_amount = None
-        for log in result_receipt.get("logs", []):
-            topics = [t.lower() for t in log.get("topics", [])]
-            if not topics or topics[0] != transfer_sig:
-                continue
-            if len(topics) < 3:
-                continue
-            if topics[2] != dest_topic:
-                continue
-            credited_amount = int(log.get("data", "0x0"), 16) / (10 ** 18)
-            break
-        if credited_amount is None:
-            await interaction.followup.send("Could not parse deposit amount from transaction.", ephemeral=True)
-            return
-    except Exception as exc:
-        logging.error("Proof check failed: %s", exc)
-        await interaction.followup.send("Failed to verify transaction.", ephemeral=True)
-        return
-    await bot.db.execute(
-        "UPDATE deposit_addresses SET status='USED', used_at=? WHERE address=?",
-        (utcnow().isoformat(), row["address"]),
-    )
-    await bot.economy.add_ledger_entry(
-        interaction.user.id,
-        credited_amount,
-        "DEPOSIT",
-        note=f"Manual proof {txhash}",
-        ref=txhash,
-    )
-    await interaction.followup.send("Deposit credited!", ephemeral=True)
-
-
 
 
 @PharaohBot.listen("on_message")
