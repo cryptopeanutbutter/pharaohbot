@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import aiosqlite
 import discord
 from discord import app_commands
+from discord.app_commands.errors import CommandAlreadyRegistered
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import requests
@@ -345,13 +346,17 @@ class PharaohBot(commands.Bot):
         self.db = db
         self.economy = Economy(db, config)
         self.price_cache = price_cache
-        self.tree = app_commands.CommandTree(self)
         self.voice_presence: Dict[int, dt.datetime] = {}
         self.chat_cooldowns: Dict[Tuple[int, int], dt.datetime] = {}
 
     async def setup_hook(self) -> None:
         await self.db.init()
         await self.sync_config()
+        for command in SLASH_COMMANDS:
+            try:
+                self.tree.add_command(command)
+            except CommandAlreadyRegistered:
+                pass
         voice_tick_loop.start(self)
         guild = discord.Object(id=self.config.guild_id) if self.config.guild_id else None
         await self.tree.sync(guild=guild)
@@ -468,7 +473,7 @@ async def ensure_interaction_response(interaction: discord.Interaction) -> None:
 # ---------------------------------------------
 
 
-@PharaohBot.tree.command(name="balance", description="Show your pDAI balance and activity stats.")
+@app_commands.command(name="balance", description="Show your pDAI balance and activity stats.")
 async def balance_command(interaction: discord.Interaction) -> None:
     bot: PharaohBot = interaction.client  # type: ignore
     await ensure_interaction_response(interaction)
@@ -496,7 +501,7 @@ async def balance_command(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@PharaohBot.tree.command(name="withdraw", description="Request a withdrawal.")
+@app_commands.command(name="withdraw", description="Request a withdrawal.")
 @app_commands.describe(amount="Amount of pDAI", to_address="Destination address")
 async def withdraw_command(interaction: discord.Interaction, amount: float, to_address: str) -> None:
     bot: PharaohBot = interaction.client  # type: ignore
@@ -683,7 +688,7 @@ async def handle_withdrawal_status(
             pass
 
 
-@PharaohBot.tree.command(name="setvc", description="Set the voice channel that grants rewards.")
+@app_commands.command(name="setvc", description="Set the voice channel that grants rewards.")
 @require_admin()
 @app_commands.describe(voice_channel="Voice channel to monitor")
 async def setvc_command(interaction: discord.Interaction, voice_channel: discord.VoiceChannel) -> None:
@@ -696,7 +701,7 @@ async def setvc_command(interaction: discord.Interaction, voice_channel: discord
     await interaction.response.send_message(f"Monitored VC set to {voice_channel.mention}.", ephemeral=True)
 
 
-@PharaohBot.tree.command(name="settext", description="Toggle a text channel for earning.")
+@app_commands.command(name="settext", description="Toggle a text channel for earning.")
 @require_admin()
 @app_commands.describe(text_channel="Text channel to toggle")
 async def settext_command(interaction: discord.Interaction, text_channel: discord.TextChannel) -> None:
@@ -717,7 +722,7 @@ async def settext_command(interaction: discord.Interaction, text_channel: discor
     await interaction.response.send_message(f"Channel {text_channel.mention} {action} for earning.", ephemeral=True)
 
 
-@PharaohBot.tree.command(name="setrate", description="Update runtime tunables.")
+@app_commands.command(name="setrate", description="Update runtime tunables.")
 @require_admin()
 @app_commands.describe(key="Config key", value="New value")
 async def setrate_command(interaction: discord.Interaction, key: str, value: str) -> None:
@@ -748,7 +753,7 @@ async def setrate_command(interaction: discord.Interaction, key: str, value: str
     await interaction.response.send_message(f"{key} updated to {value}", ephemeral=True)
 
 
-@PharaohBot.tree.command(name="grant", description="Owner: grant pDAI to a user.")
+@app_commands.command(name="grant", description="Owner: grant pDAI to a user.")
 @require_owner()
 @app_commands.describe(user="User to grant", amount="Amount of pDAI")
 async def grant_command(interaction: discord.Interaction, user: discord.User, amount: float) -> None:
@@ -757,13 +762,24 @@ async def grant_command(interaction: discord.Interaction, user: discord.User, am
     await interaction.response.send_message(f"Granted {amount} pDAI to {user.display_name}.", ephemeral=True)
 
 
-@PharaohBot.tree.command(name="revoke", description="Owner: revoke pDAI from a user.")
+@app_commands.command(name="revoke", description="Owner: revoke pDAI from a user.")
 @require_owner()
 @app_commands.describe(user="User", amount="Amount to revoke")
 async def revoke_command(interaction: discord.Interaction, user: discord.User, amount: float) -> None:
     bot: PharaohBot = interaction.client  # type: ignore
     await bot.economy.add_ledger_entry(user.id, -amount, "REVOKE", note=f"Manual revoke by {interaction.user}")
     await interaction.response.send_message(f"Revoked {amount} pDAI from {user.display_name}.", ephemeral=True)
+
+
+SLASH_COMMANDS = [
+    balance_command,
+    withdraw_command,
+    setvc_command,
+    settext_command,
+    setrate_command,
+    grant_command,
+    revoke_command,
+]
 
 
 @PharaohBot.listen("on_message")
